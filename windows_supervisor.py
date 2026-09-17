@@ -83,8 +83,15 @@ def _alert_crash(reason: str) -> None:
 
 
 def _clean_exit() -> bool:
+    """Только свежий STOP из GUI. Старый heartbeat 'stopped' не глушит start.bat."""
     data = read() or {}
-    return str(data.get("status") or "") == "stopped"
+    if str(data.get("status") or "") != "stopped":
+        return False
+    try:
+        ts = float(data.get("ts") or 0)
+    except (TypeError, ValueError):
+        return False
+    return ts > 1_000_000_000 and (time.time() - ts) < 60
 
 
 def main() -> int:
@@ -115,8 +122,9 @@ def main() -> int:
     _start_watchdog()
     crashes = 0
     while True:
+        print("Windows supervisor: запускаю GUI…", flush=True)
         proc = subprocess.Popen(
-            [str(PY), str(MAIN)], cwd=str(BASE_DIR), env=_child_env()
+            [str(PY), "-X", "utf8", "-u", str(MAIN)], cwd=str(BASE_DIR), env=_child_env()
         )
         code = proc.wait()
         if _clean_exit() or code == 0:

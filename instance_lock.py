@@ -40,10 +40,39 @@ _ReleaseMutex = _kernel32.ReleaseMutex
 _ReleaseMutex.argtypes = [wintypes.HANDLE]
 _ReleaseMutex.restype = wintypes.BOOL
 _CloseHandle = _kernel32.CloseHandle
+ERROR_ALREADY_EXISTS = 183
+
+
+def _dbg(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
+    # #region agent log
+    try:
+        from models import agent_dbg
+
+        agent_dbg(hypothesis_id, location, message, data)
+    except Exception:
+        pass
+    # #endregion
+
+
+def _acquire_owned_mutex(name: str):
+    """Singleton: свой mutex. Брошенный после краша забираем; живой чужой — отказ."""
+    ctypes.set_last_error(0)
+    handle = _CreateMutexW(None, True, name)
+    err = ctypes.get_last_error()
+    if not handle:
+        return None
+    if err == ERROR_ALREADY_EXISTS:
+        # WAIT_ABANDONED = прошлый процесс умер, mutex свободен
+        res = _WaitForSingleObject(handle, 0)
+        if res in (WAIT_OBJECT_0, WAIT_ABANDONED):
+            return handle
+        _CloseHandle(handle)
+        return None
+    return handle
 
 
 def _acquire_mutex(name: str, *, wait_ms: int = 0):
-    """Global\\ — один на всю машину (Local\\ иногда не видит чужой сеанс)."""
+    """Ждём чужой mutex (Telethon session). Singleton'ы — через _acquire_owned_mutex."""
     ctypes.set_last_error(0)
     handle = _CreateMutexW(None, False, name)
     if not handle:
@@ -90,6 +119,12 @@ def _release_file_lock(f) -> None:
         f.close()
     except OSError:
         pass
+
+
+def _is_our_script(low: str, script: str) -> bool:
+    """True для '...\\main.py', не для случайной подстроки вроде af_boot_main.py."""
+    needle = script.casefold()
+    return f"\\{needle}" in low or f"/{needle}" in low or f" {needle}" in low
 
 
 def kill_duplicate_parsers(
@@ -152,12 +187,11 @@ def kill_duplicate_parsers(
         # _python = base_prefix для .venv. Это НЕ второй парсер.
         if "\\_python\\" in low:
             continue
-        if not any(m in low for m in markers):
+        if not any(_is_our_script(low, m) for m in markers):
             continue
         # не трогаем чужие проекты без нашего пути, если путь читаем
         if base not in low and "парсер2" not in low:
-            # кракозябры в CommandLine — всё равно режем по маркерам main/watchdog
-            if "main.py" not in low and "watchdog.py" not in low:
+            if not _is_our_script(low, "main.py") and not _is_our_script(low, "watchdog.py"):
                 if not include_supervisor:
                     continue
         try:
@@ -227,8 +261,9 @@ def acquire_gui_lock() -> bool:
     global _handle
     if _handle is not None:
         return True
-    handle = _acquire_mutex("Global\\ARTFranceThreadsParserGUI")
+    handle = _acquire_owned_mutex("Global\\ARTFranceThreadsParserGUI")
     if handle is None:
+        _dbg("I", "instance_lock.py:acquire_gui_lock", "lock_fail", {"kind": "gui"})
         return False
     try:
         LOCK_PATH.write_text(str(os.getpid()), encoding="ascii")
@@ -239,25 +274,34 @@ def acquire_gui_lock() -> bool:
 
 
 def acquire_supervisor_lock() -> bool:
-    """Один start.bat / windows_supervisor. Сначала mutex, потом чистка main/watchdog."""
+    """Один start.bat / windows_supervisor. Сначала mutex, потом чистка дублей."""
     global _sup_handle, _sup_file
     if _sup_handle is not None and _sup_file is not None:
         return True
-    handle = _acquire_mutex("Global\\ARTFranceThreadsParserSupervisor", wait_ms=500)
+    handle = _acquire_owned_mutex("Global\\ARTFranceThreadsParserSupervisor")
     if handle is None:
+        _dbg("I", "instance_lock.py:acquire_supervisor_lock", "lock_fail", {"kind": "supervisor"})
         return False
     f = _acquire_file_lock(SUPERVISOR_LOCK)
+    if f is None:
+        time.sleep(1.0)
+        f = _acquire_file_lock(SUPERVISOR_LOCK)
     if f is None:
         try:
             _ReleaseMutex(handle)
             _CloseHandle(handle)
         except Exception:
             pass
+        _dbg("I", "instance_lock.py:acquire_supervisor_lock", "lock_fail", {"kind": "supervisor_file"})
         return False
     _sup_handle = handle
     _sup_file = f
-    # Мы владельцы слота — убрать лишние main/watchdog (не supervisor)
-    kill_duplicate_parsers(include_watchdog=True, include_supervisor=False)
+    _dbg(
+        "I",
+        "instance_lock.py:acquire_supervisor_lock",
+        "lock_ok",
+        {"kind": "supervisor", "pid": os.getpid()},
+    )
     return True
 
 
@@ -266,19 +310,30 @@ def acquire_main_lock() -> bool:
     global _main_handle, _main_file
     if _main_handle is not None and _main_file is not None:
         return True
-    handle = _acquire_mutex("Global\\ARTFranceThreadsParserMain", wait_ms=300)
+    handle = _acquire_owned_mutex("Global\\ARTFranceThreadsParserMain")
     if handle is None:
+        _dbg("I", "instance_lock.py:acquire_main_lock", "lock_fail", {"kind": "main"})
         return False
     f = _acquire_file_lock(MAIN_LOCK_PATH)
+    if f is None:
+        time.sleep(1.0)
+        f = _acquire_file_lock(MAIN_LOCK_PATH)
     if f is None:
         try:
             _ReleaseMutex(handle)
             _CloseHandle(handle)
         except Exception:
             pass
+        _dbg("I", "instance_lock.py:acquire_main_lock", "lock_fail", {"kind": "main_file"})
         return False
     _main_handle = handle
     _main_file = f
+    _dbg(
+        "I",
+        "instance_lock.py:acquire_main_lock",
+        "lock_ok",
+        {"kind": "main", "pid": os.getpid()},
+    )
     return True
 
 
@@ -286,7 +341,7 @@ def acquire_bot_poll_lock() -> bool:
     global _bot_handle
     if _bot_handle is not None:
         return True
-    handle = _acquire_mutex("Global\\ARTFranceThreadsParserBotPoll")
+    handle = _acquire_owned_mutex("Global\\ARTFranceThreadsParserBotPoll")
     if handle is None:
         return False
     _bot_handle = handle

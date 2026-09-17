@@ -14,5 +14,9 @@ if not exist ".env" (
 )
 
 set "PLAYWRIGHT_BROWSERS_PATH="
-".venv\Scripts\python.exe" windows_supervisor.py
-if errorlevel 1 pause
+echo Starting ARTFrance...
+".venv\Scripts\python.exe" -X utf8 -u windows_supervisor.py
+set "ERR=%ERRORLEVEL%"
+echo.
+echo Stopped, code %ERR%
+if not "%ERR%"=="0" pause

@@ -1474,11 +1474,11 @@ class SeasideApp(ctk.CTk):
         except ValueError:
             parse_posts = 80
             self.parse_var.set("80")
-        # Не даём UI оставить 5 постов, но и не гоним циклы чаще, чем
-        # терпит Threads: слишком частый поиск = HTTP 429 и пустая выдача.
-        parse_posts = max(parse_posts, 60)
+        # Не даём UI оставить 5 постов, но и не гоним 60+ — это 429.
+        parse_posts = max(parse_posts, 15)
+        parse_posts = min(parse_posts, 30)
         self.parse_var.set(str(parse_posts))
-        interval = max(interval, 5)
+        interval = max(interval, 8)
         self.interval_var.set(str(interval))
 
         self._persist()
@@ -1510,8 +1510,9 @@ class SeasideApp(ctk.CTk):
         )
         try:
             self.worker.start(self._hashtags, interval, parse_posts)
-        except ValueError as exc:
+        except Exception as exc:
             messagebox.showerror("START", str(exc))
+            self._append_log(f"START не удался: {exc}")
             return
 
         self._set_controls(running=True)
@@ -1597,18 +1598,27 @@ class SeasideApp(ctk.CTk):
         self.destroy()
 
 
-def run_gui() -> None:
+def run_gui() -> int:
     from instance_lock import acquire_gui_lock
 
     if not acquire_gui_lock():
-        messagebox.showerror(
-            APP_NAME,
-            "Парсер уже открыт в другом окне.\n"
-            "Оставь одно окно и один start.bat — иначе Telegram бот даёт ошибку 409.",
-        )
-        return
-    app = SeasideApp()
-    app.mainloop()
+        print("Парсер уже открыт в другом окне. Закрой лишний start.bat.")
+        try:
+            messagebox.showerror(
+                APP_NAME,
+                "Парсер уже открыт в другом окне.\n"
+                "Оставь одно окно и один start.bat — иначе Telegram бот даёт ошибку 409.",
+            )
+        except Exception:
+            pass
+        return 2
+    try:
+        app = SeasideApp()
+        app.mainloop()
+    except Exception as exc:
+        print(f"GUI crash: {type(exc).__name__}: {exc}")
+        raise
+    return 0
 
 
 if __name__ == "__main__":

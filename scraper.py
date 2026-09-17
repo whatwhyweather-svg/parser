@@ -20,9 +20,8 @@ from hashtags import (
     post_matches_tag,
     query_fetch_cap,
     search_queries_for_tag,
-    text_mentions_tag,
 )
-from models import ThreadPost, human_delay, logger
+from models import ThreadPost, agent_dbg, human_delay, logger
 from scan_log import write as scan_log
 from playwright_env import fix_playwright_browsers_path
 from session_store import SESSION_PATH, load_username, save_username, session_exists
@@ -338,6 +337,7 @@ def parse_thread_item(
     *,
     from_tag_search: bool = False,
     own_username: str | None = None,
+    query: str = "",
 ) -> ThreadPost | None:
     post = item.get("post") or {}
     if not post or _is_reply_or_repost(item, post):
@@ -365,6 +365,7 @@ def parse_thread_item(
         hashtag,
         from_tag_search=from_tag_search,
         own_post=False,
+        query=query,
     ):
         return None
 
@@ -391,6 +392,7 @@ def _collect_from_thread_items(
     *,
     from_tag_search: bool = False,
     own_username: str | None = None,
+    query: str = "",
 ) -> tuple[list[ThreadPost], int]:
     posts: list[ThreadPost] = []
     seen: set[str] = set()
@@ -404,6 +406,7 @@ def _collect_from_thread_items(
             hashtag,
             from_tag_search=from_tag_search,
             own_username=own_username,
+            query=query,
         )
         if parsed and parsed.post_id not in seen:
             seen.add(parsed.post_id)
@@ -417,6 +420,7 @@ def _collect_from_dom(
     *,
     own_username: str | None = None,
     from_tag_search: bool = False,
+    query: str = "",
 ) -> list[ThreadPost]:
     posts: list[ThreadPost] = []
     seen: set[str] = set()
@@ -452,9 +456,17 @@ def _collect_from_dom(
         posted_at = _guess_posted_at_from_ui(text)
         comments_guess = _guess_comments_from_ui(text)
         body = clean_post_text(text)
-        if not from_tag_search:
-            if not text_mentions_tag(body, tag) and not text_mentions_tag(text, tag):
-                continue
+        probe = (body or text or "").lstrip()
+        if probe.lower().startswith("в ответ @") or probe.lower().startswith("reply to @"):
+            continue
+        if not post_matches_tag(
+            body or text,
+            {},
+            tag,
+            from_tag_search=from_tag_search,
+            query=query,
+        ):
+            continue
 
         image_url = None
         try:
@@ -529,6 +541,7 @@ class ThreadsScraper:
         self._context: BrowserContext | None = None
         # Когда Threads последний раз ответил 429 на поиск
         self.rate_limited_at = 0.0
+        self._warmed = False
 
     def set_parse_posts(self, value: int) -> None:
         self.parse_posts = max(1, min(200, int(value)))
@@ -678,7 +691,7 @@ class ThreadsScraper:
         assert self._context is not None
         page = self._context.new_page()
         try:
-            page.goto("https://www.threads.net/", wait_until="domcontentloaded", timeout=60_000)
+            page.goto("https://www.threads.com/", wait_until="domcontentloaded", timeout=60_000)
             prepare_threads_page(page)
             human_delay(1.5, 2.5)
             if looks_like_login_wall(page) or not context_has_auth(self._context):
@@ -738,6 +751,18 @@ class ThreadsScraper:
         # Быстрый цикл: меньше страниц, hire-запросы первые
         deadline = time.time() + (150 if watch else 200)
         try:
+            if not self._warmed:
+                try:
+                    page.goto(
+                        "https://www.threads.com/",
+                        wait_until="domcontentloaded",
+                        timeout=25_000,
+                    )
+                    page.wait_for_timeout(random.randint(2800, 5000))
+                    self._warmed = True
+                    logger.info("Прогрел ленту Threads перед поиском")
+                except Exception as exc:
+                    logger.warning("Прогрев ленты: %s", str(exc)[:160])
             merged: dict[str, ThreadPost] = {}
             order: list[str] = []
             queries = search_queries_for_tag(tag)
@@ -748,7 +773,7 @@ class ThreadsScraper:
                     break
                 if qi:
                     # Пауза между поисками: без неё Threads выдаёт 429
-                    page.wait_for_timeout(random.randint(2500, 5000))
+                    page.wait_for_timeout(random.randint(8000, 14000))
                 if time.time() >= deadline:
                     if on_progress:
                         on_progress(f"#{tag}: дедлайн, собрано {len(merged)}")
@@ -767,17 +792,19 @@ class ThreadsScraper:
                 # Hire-фразы — сразу целимся в лимит
                 if qi < 3 or not query.strip().startswith("#"):
                     want = min(cap, max(want, min(25, target - len(merged))))
+                # #тег: вся лента. Hire-фраза: только посты про SEO,
+                # иначе «нужен сеошник» набивает карусель шкафами/свиданиями.
+                is_tag_feed = query.strip().startswith("#")
                 try:
-                    # Тематику задаёт сам запрос: «ищу сеошника» без слова SEO
-                    # раньше молча выбрасывалось здесь, не доходя до фильтра.
                     chunk = self._search_on_page(
                         page,
                         tag,
                         url,
                         label,
-                        from_tag_search=True,
+                        from_tag_search=is_tag_feed,
                         target_count=want,
                         watch=watch,
+                        query=query,
                     )
                 except Exception as exc:
                     logger.warning("Recent «%s» сорвался: %s", label, str(exc)[:160])
@@ -814,6 +841,21 @@ class ThreadsScraper:
                 len(result),
                 target,
             )
+            # #region agent log
+            agent_dbg(
+                "A",
+                "scraper.py:search_hashtag",
+                "hashtag_done",
+                {
+                    "tag": tag,
+                    "queries": len(queries),
+                    "labels": [str(lab)[:40] for lab, _q in queries],
+                    "merged": len(result),
+                    "target": target,
+                    "rate_limited": bool(self.rate_limited_at),
+                },
+            )
+            # #endregion
             return result
 
         finally:
@@ -832,6 +874,7 @@ class ThreadsScraper:
         from_tag_search: bool = False,
         target_count: int = 5,
         watch: bool = False,
+        query: str = "",
     ) -> list[ThreadPost]:
         """Верх выдачи Recent. watch=быстрее (меньше пауз и скроллов)."""
         by_id: dict[str, ThreadPost] = {}
@@ -843,13 +886,26 @@ class ThreadsScraper:
         # Быстрее: меньше скроллов — как ручной топ Recent
         max_scrolls = max(4, min(10, target_count // 5 + 3))
         url_deadline = time.time() + (28 if fast else 40)
+        http_status = 0
+        login_wall = False
+        xhr_429 = 0
+        gql_hits = 0
+        api_hits = 0
+        t0 = time.time()
 
         def on_response(response) -> None:
-            nonlocal raw_groups_total
+            nonlocal raw_groups_total, xhr_429, gql_hits, api_hits
             try:
-                req_url = response.url
+                req_url = response.url or ""
+                status = int(getattr(response, "status", 0) or 0)
+                if status == 429:
+                    xhr_429 += 1
                 if "graphql" not in req_url and "/api/" not in req_url:
                     return
+                if "graphql" in req_url:
+                    gql_hits += 1
+                else:
+                    api_hits += 1
                 ctype = (response.headers or {}).get("content-type", "")
                 if "json" not in ctype and "javascript" not in ctype:
                     return
@@ -861,6 +917,7 @@ class ThreadsScraper:
                 tag,
                 from_tag_search=from_tag_search,
                 own_username=own,
+                query=query,
             )
             raw_groups_total += raw_n
             for post in posts:
@@ -871,7 +928,11 @@ class ThreadsScraper:
             seen: set[str] = set()
             try:
                 for post in _collect_from_dom(
-                    page, tag, own_username=own, from_tag_search=from_tag_search
+                    page,
+                    tag,
+                    own_username=own,
+                    from_tag_search=from_tag_search,
+                    query=query,
                 ):
                     full = by_id.get(post.post_id, post)
                     if full.post_id in seen:
@@ -901,10 +962,24 @@ class ThreadsScraper:
             ):
                 try:
                     resp = page.goto(url, wait_until=wait_until, timeout=18_000)
+                    if resp is not None:
+                        http_status = int(resp.status or 0)
                     if resp is not None and resp.status == 429:
                         # Threads зарейтлимитил поиск — дальше долбить бессмысленно
                         self.rate_limited_at = time.time()
                         logger.warning("HTTP 429 на «%s» — поиск лимитирован", label)
+                        # #region agent log
+                        agent_dbg(
+                            "A",
+                            "scraper.py:_search_on_page",
+                            "http_429",
+                            {
+                                "label": label,
+                                "http_status": http_status,
+                                "elapsed_ms": int((time.time() - t0) * 1000),
+                            },
+                        )
+                        # #endregion
                         return []
                     last_goto = None
                     break
@@ -945,7 +1020,20 @@ class ThreadsScraper:
             logger.info("URL: %s", page.url)
 
             if looks_like_login_wall(page):
+                login_wall = True
                 logger.warning("Экран входа на «%s»", label)
+                # #region agent log
+                agent_dbg(
+                    "B",
+                    "scraper.py:_search_on_page",
+                    "login_wall",
+                    {
+                        "label": label,
+                        "http_status": http_status,
+                        "page_host": (page.url or "")[:80],
+                    },
+                )
+                # #endregion
                 return []
 
             containers = 0
@@ -963,7 +1051,7 @@ class ThreadsScraper:
             try:
                 html = page.content()
                 embedded, raw_n = self._parse_embedded_json(
-                    html, tag, from_tag_search=from_tag_search
+                    html, tag, from_tag_search=from_tag_search, query=query
                 )
                 raw_groups_total += raw_n
                 for post in embedded:
@@ -988,7 +1076,7 @@ class ThreadsScraper:
                 try:
                     html = page.content()
                     embedded, raw_n = self._parse_embedded_json(
-                        html, tag, from_tag_search=from_tag_search
+                        html, tag, from_tag_search=from_tag_search, query=query
                     )
                     raw_groups_total += raw_n
                     for post in embedded:
@@ -1013,6 +1101,29 @@ class ThreadsScraper:
                 raw_groups_total,
                 scrolls,
             )
+            # #region agent log
+            agent_dbg(
+                "E",
+                "scraper.py:_search_on_page",
+                "page_done",
+                {
+                    "label": label,
+                    "http_status": http_status,
+                    "login_wall": login_wall,
+                    "xhr_429": xhr_429,
+                    "gql_hits": gql_hits,
+                    "api_hits": api_hits,
+                    "json_posts": len(by_id),
+                    "dom_containers": containers,
+                    "raw_groups": raw_groups_total,
+                    "result": len(result),
+                    "target": target_count,
+                    "scrolls": scrolls,
+                    "elapsed_ms": int((time.time() - t0) * 1000),
+                    "rate_limited": bool(self.rate_limited_at),
+                },
+            )
+            # #endregion
             return result[:target_count]
         finally:
             try:
@@ -1026,6 +1137,7 @@ class ThreadsScraper:
         hashtag: str,
         *,
         from_tag_search: bool = False,
+        query: str = "",
     ) -> tuple[list[ThreadPost], int]:
         posts: list[ThreadPost] = []
         seen: set[str] = set()
@@ -1047,6 +1159,7 @@ class ThreadsScraper:
                 hashtag,
                 from_tag_search=from_tag_search,
                 own_username=self.my_username,
+                query=query,
             )
             raw_total += raw_n
             for post in chunk:

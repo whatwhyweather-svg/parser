@@ -110,6 +110,48 @@ class Settings:
     telegram_user_enabled: bool = False
 
 
+# Тестовый пин: все ЛС / статусы / алерты только сюда. 0 = обычный режим.
+TEST_ONLY_TG_ID = 0
+
+
+def pinned_delivery_id() -> int:
+    try:
+        return int(TEST_ONLY_TG_ID or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _read_test_bot_token() -> str:
+    env_tok = (
+        os.getenv("TEST_TELEGRAM_BOT_TOKEN")
+        or os.getenv("TELEGRAM_BOT_TOKEN_TEST")
+        or ""
+    ).strip()
+    if env_tok:
+        return env_tok
+    secret = BASE_DIR / "test_bot.secret"
+    if not secret.is_file():
+        return ""
+    try:
+        return secret.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def resolve_bot_token() -> tuple[str, str]:
+    """(token, source). Боевой бот из .env, пока TEST_ONLY_TG_ID = 0."""
+    if pinned_delivery_id():
+        test = _read_test_bot_token()
+        if not test:
+            raise ValueError(
+                "Тестовый режим: нет токена второго бота. "
+                "Положи его в test_bot.secret или TEST_TELEGRAM_BOT_TOKEN."
+            )
+        return test, "test_bot"
+    prod = _env("TELEGRAM_BOT_TOKEN")
+    return prod, "prod"
+
+
 # Ключи MTProto самого приложения. Пользователь вводит только номер.
 # Свои можно задать в .env (TELEGRAM_API_ID / TELEGRAM_API_HASH).
 _BUILTIN_TG_API_ID = 6
@@ -231,8 +273,10 @@ def load_settings() -> Settings:
     ).strip() or "tg_user.session"
     user_enabled = _env_bool("TELEGRAM_USER_ENABLED", False)
 
+    bot_token, _bot_src = resolve_bot_token()
+
     return Settings(
-        telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),
+        telegram_bot_token=bot_token,
         telegram_chat_id=_env("TELEGRAM_CHAT_ID", "-1004428286062"),
         search_hashtags=hashtags,
         check_interval_minutes=int(os.getenv("CHECK_INTERVAL_MINUTES", "15")),

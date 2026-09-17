@@ -77,6 +77,10 @@ class ThreadPost:
         return tag == "telegram" or url.startswith("https://t.me/")
 
 
+def agent_dbg(*_a, **_k) -> None:
+    return
+
+
 def human_delay(min_sec: float = 1.2, max_sec: float = 3.5) -> None:
     delay = random.uniform(min_sec, max_sec)
     time.sleep(delay)

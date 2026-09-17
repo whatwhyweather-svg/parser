@@ -49,7 +49,7 @@ def touch(status: str, *, extra: str = "", progress: bool = False) -> None:
 
 def read() -> dict | None:
     try:
-        return json.loads(HEARTBEAT_PATH.read_text(encoding="utf-8"))
+        return json.loads(HEARTBEAT_PATH.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return None
 

@@ -8,3 +8,4 @@ PySocks==1.7.1
 python-socks[asyncio]==2.7.1
 qrcode==8.0
 pillow==11.1.0
+telethon==1.38.1

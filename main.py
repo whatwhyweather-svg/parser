@@ -68,21 +68,36 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if not acquire_main_lock():
+        print("Парсер уже запущен — закрой второе окно.")
         logger.error(
             "Уже запущен другой main.py — два процесса убивают Telegram-сессию. "
             "Закрой лишнее окно."
         )
-        print("Парсер уже запущен — закрой второе окно.")
         return 2
+
+    print("ARTFrance: окно парсера…", flush=True)
 
     if args.cli:
         return run_cli()
 
     from gui import run_gui
 
-    run_gui()
-    return 0
+    return int(run_gui() or 0)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        from models import agent_dbg, logger
+
+        logger.exception("main crash")
+        # #region agent log
+        agent_dbg(
+            "F",
+            "main.py:__main__",
+            "uncaught",
+            {"err": type(exc).__name__, "msg": str(exc)[:180]},
+        )
+        # #endregion
+        raise

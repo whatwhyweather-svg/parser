@@ -7,12 +7,12 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
-from config import Settings
+from config import Settings, pinned_delivery_id
 from database import PostDatabase
 from deepseek_filter import DeepSeekFilter
 from filters import looks_like_clear_hire, post_passes_filters, scrub_post_text
-from hashtags import display_hashtag, normalize_hashtags
-from models import ThreadPost, escape_html, logger
+from hashtags import display_hashtag, normalize_hashtag, normalize_hashtags
+from models import ThreadPost, agent_dbg, escape_html, logger
 from scraper import ThreadsScraper
 from telegram_sender import TelegramSender, lead_keyboard
 from heartbeat import touch as heartbeat_touch
@@ -211,17 +211,26 @@ class ParserWorker:
     ) -> bool:
         """ЛС только тем из белого списка, кто нажал /start."""
         _ = tag
-        allowed = set(getattr(self.settings, "allowed_tg_ids", ()) or ())
-        allowed |= set(getattr(self.settings, "allowed_tg_ids", ()) or ())
-        for key in ("alert_tg_id", "alert_tg_id"):
+        pin = pinned_delivery_id()
+        allowed = {pin} if pin else set(getattr(self.settings, "allowed_tg_ids", ()) or ())
+        if not pin:
             try:
-                extra = int(getattr(self.settings, key, 0) or 0)
+                extra = int(getattr(self.settings, "alert_tg_id", 0) or 0)
             except (TypeError, ValueError):
                 extra = 0
             if extra:
                 allowed.add(extra)
         users = db.all_started_users()
-        if allowed:
+        if pin:
+            users = [
+                u
+                for u in users
+                if int(u.get("user_id", 0) or 0) == pin
+                or int(u.get("chat_id", 0) or 0) == pin
+            ]
+            if not users:
+                users = [{"user_id": pin, "chat_id": pin, "username": ""}]
+        elif allowed:
             users = [u for u in users if int(u.get("user_id", 0)) in allowed]
         else:
             # Пустой белый список = никому нельзя
@@ -302,6 +311,13 @@ class ParserWorker:
             raw = post.text or ""
             text = scrub_post_text(raw)
             post = replace(post, text=text or raw)
+            probe = (text or raw).lstrip()
+            if probe.lower().startswith("в ответ @") or probe.lower().startswith(
+                "reply to @"
+            ):
+                reasons["ответ в ветке"] = reasons.get("ответ в ветке", 0) + 1
+                self._seen(tag, post, "✗ ответ в ветке")
+                continue
             if self._db and post.post_id and self._db.exists(post.post_id):
                 reasons["уже в базе"] = reasons.get("уже в базе", 0) + 1
                 self._seen(tag, post, "✗ уже в базе")
@@ -316,7 +332,8 @@ class ParserWorker:
                 self._seen(tag, post, f"✗ {key}")
                 continue
             posted_at = float(getattr(post, "posted_at", 0) or 0)
-            if max_age_h > 0 and posted_at > 0:
+            # Явный найм не режем по возрасту: в Recent висят недели, это всё ещё заказ.
+            if not clear_hire and max_age_h > 0 and posted_at > 0:
                 age_h = (now - posted_at) / 3600.0
                 if age_h > max_age_h:
                     key = f"старше {max_age_h}ч ({int(age_h)}ч)"
@@ -379,14 +396,87 @@ class ParserWorker:
         try:
             sender = TelegramSender(self.settings)
             bot_name = sender.verify_access()
+            # #region agent log
+            try:
+                from tg_mtproto import detect_local_socks
+                from tg_user_source import auto_mtproto_proxy_url
+
+                mt_on = bool(auto_mtproto_proxy_url())
+                socks = bool(detect_local_socks())
+            except Exception:
+                mt_on = False
+                socks = False
+            env_proxy = (getattr(self.settings, "telegram_proxy", None) or "").strip()
+            env_kind = env_proxy.split("://", 1)[0].lower() if env_proxy else "none"
+            try:
+                from config import resolve_bot_token
+
+                _tok, token_source = resolve_bot_token()
+                _ = _tok
+            except Exception:
+                token_source = "unknown"
+            pin = pinned_delivery_id()
+            ping_ok = False
+            ping_err = ""
+            if pin:
+                try:
+                    db.upsert_user(pin, pin, active=True)
+                    sender._call_with_retry(
+                        "testPing",
+                        lambda: sender.bot.send_message(
+                            chat_id=pin,
+                            text=(
+                                "<b>Тест ARTFrance</b>\n"
+                                "Бот жив. Лиды, статусы и алерты в этом прогоне "
+                                f"только на <code>{pin}</code>."
+                            ),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        ),
+                    )
+                    ping_ok = True
+                except Exception as ping_exc:
+                    ping_err = type(ping_exc).__name__
+                    self._emit(
+                        message=f"✗ тест ЛС → {pin}: {type(ping_exc).__name__}"
+                    )
+            agent_dbg(
+                "D",
+                "worker.py:_run",
+                "worker_start",
+                {
+                    "bot_ok": True,
+                    "bot_name": bot_name,
+                    "tgws_auto": mt_on,
+                    "local_socks": socks,
+                    "env_proxy_kind": env_kind,
+                    "token_source": token_source,
+                    "parse_posts": int(self.parse_posts),
+                    "interval_min": int(self.interval_minutes),
+                    "tags": len(self._current_hashtags()),
+                    "pin_id": pin,
+                    "ping_ok": ping_ok,
+                    "ping_err": ping_err,
+                },
+            )
+            # #endregion
             self._emit(
                 message=(
-                    f"✓ Telegram · бот {bot_name} · рассылка в ЛС "
-                    "всем, кто нажал /start"
+                    f"✓ Telegram · бот {bot_name} · тест ЛС только "
+                    f"{pinned_delivery_id() or 'whitelist'}"
+                    + (" · пинг ушёл" if pinned_delivery_id() and ping_ok else "")
                 )
             )
         except Exception as exc:
             fatal = str(exc)
+            # #region agent log
+            agent_dbg(
+                "C",
+                "worker.py:_run",
+                "bot_verify_fail",
+                {"err": type(exc).__name__, "network": "timeout" in fatal.lower() or "network" in fatal.lower()},
+            )
+            # #endregion
             self._emit(status="error", message=fatal)
             self._alert_admin(sender, f"⛔ Старт не удался\n{fatal}")
             self.stats.status = "idle"
@@ -467,7 +557,7 @@ class ParserWorker:
                     if getattr(scraper, "rate_limited_at", 0):
                         scraper.rate_limited_at = 0.0
                         self._rate_limit_hits += 1
-                        pause_min = min(60, 15 * self._rate_limit_hits)
+                        pause_min = min(45, 20 * self._rate_limit_hits)
                         if self._throttle(db, "alert_429_ts", 1800):
                             self._alert_admin(
                                 sender,
@@ -537,6 +627,15 @@ class ParserWorker:
 
     def _status_recipients(self, db: PostDatabase) -> list[int]:
         """Все, кто /start + в белом списке (как получатели лидов)."""
+        pin = pinned_delivery_id()
+        if pin:
+            users = db.all_started_users()
+            for u in users:
+                uid = int(u.get("user_id") or 0)
+                cid = int(u.get("chat_id") or uid or 0)
+                if uid == pin or cid == pin:
+                    return [cid or pin]
+            return [pin]
         allowed = set(getattr(self.settings, "allowed_tg_ids", ()) or ())
         try:
             extra = int(getattr(self.settings, "alert_tg_id", 0) or 0)
@@ -590,9 +689,9 @@ class ParserWorker:
         except ValueError:
             last_ts = 0.0
         now = time.time()
-        if last_ts and now - last_ts < interval * 60:
+        if self.stats.cycle < 2:
             return
-        if not last_ts and self.stats.cycle < 1:
+        if last_ts and now - last_ts < interval * 60:
             return
         db.set_meta("hourly_status_ts", str(now))
         text = self._build_status_text(db, window_hours=window_h)
@@ -783,6 +882,12 @@ class ParserWorker:
             if getattr(scraper, "rate_limited_at", 0):
                 self._emit(message="429 от Threads — остальные теги в этом цикле пропускаю")
                 break
+            tag_key = normalize_hashtag(tag).casefold()
+            if tag_key in {"geo", "гео"}:
+                self._emit(
+                    message=f"{display_hashtag(tag)}: пропускаю — 0 лидов, квоту отдаю SEO"
+                )
+                continue
 
             tag_ready = db.is_tag_bootstrapped(tag)
             self.stats.last_hashtag = display_hashtag(tag)
@@ -790,8 +895,8 @@ class ParserWorker:
                 self.on_stats(self.stats)
 
             limit = max(1, int(self.parse_posts))
-            # Меньше снимаем — быстрее цикл; качество даёт hire-поиск, не объём #seo
-            fetch_n = max(80, min(220, limit + 120))
+            # Не раздуваем выборку: 180 карточек + 4 запроса = мгновенный 429.
+            fetch_n = max(8, min(25, limit))
             if not tag_ready:
                 self._emit(
                     message=(
@@ -927,4 +1032,20 @@ class ParserWorker:
             self._blind_cycles += 1
         else:
             self._blind_cycles = 0
+        # #region agent log
+        agent_dbg(
+            "A",
+            "worker.py:_process_cycle",
+            "cycle_done",
+            {
+                "cycle": int(self.stats.cycle),
+                "fetched": cycle_fetched,
+                "found": int(self.stats.found),
+                "sent": int(self.stats.sent),
+                "blind": int(self._blind_cycles),
+                "rate_limited": bool(getattr(scraper, "rate_limited_at", 0)),
+                "tags": len(self._current_hashtags()),
+            },
+        )
+        # #endregion
         return any_bootstrap

@@ -11,10 +11,10 @@ import telebot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 
-from config import Settings
+from config import Settings, pinned_delivery_id
 from filters import scrub_post_text
 from hashtags import clean_post_text
-from models import ThreadPost, escape_html, logger, truncate
+from models import ThreadPost, agent_dbg, escape_html, logger, truncate
 
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
@@ -107,13 +107,50 @@ class TelegramSender:
         self.settings = settings
         self.chat_id = settings.telegram_chat_id
         proxy = getattr(settings, "telegram_proxy", None) or None
+        proxy_kind = "none"
         # MTProto (tg-ws-proxy) — только для Telethon user-API, не для Bot API / httpx
         if proxy and str(proxy).strip().lower().startswith("mtproto://"):
+            proxy_kind = "mtproto_skipped"
             proxy = None
+        elif proxy:
+            scheme = str(proxy).split("://", 1)[0].lower()
+            proxy_kind = scheme or "other"
         if proxy:
             telebot.apihelper.proxy = {"https": proxy, "http": proxy}
             logger.info("Telegram proxy: %s", proxy)
         self.bot = telebot.TeleBot(settings.telegram_bot_token, parse_mode="HTML")
+        # #region agent log
+        try:
+            from config import resolve_bot_token
+            from tg_mtproto import detect_local_socks
+            from tg_user_source import auto_mtproto_proxy_url
+
+            socks = detect_local_socks() or ""
+            socks_port = 0
+            if socks:
+                try:
+                    socks_port = int(socks.rsplit(":", 1)[-1])
+                except ValueError:
+                    socks_port = 0
+            mt_on = bool(auto_mtproto_proxy_url())
+            _tok, token_source = resolve_bot_token()
+            _ = _tok
+        except Exception:
+            socks_port = -1
+            mt_on = False
+            token_source = "unknown"
+        agent_dbg(
+            "C",
+            "telegram_sender.py:__init__",
+            "bot_proxy_setup",
+            {
+                "bot_proxy_kind": proxy_kind,
+                "tgws_1443": mt_on,
+                "local_socks_port": socks_port,
+                "token_source": token_source,
+            },
+        )
+        # #endregion
 
     def _build_body(self, post: ThreadPost, limit: int) -> str:
         tag = (post.hashtag or "").lstrip("#")
@@ -160,7 +197,17 @@ class TelegramSender:
         last: BaseException | None = None
         for i in range(1, attempts + 1):
             try:
-                return fn()
+                out = fn()
+                if i > 1:
+                    # #region agent log
+                    agent_dbg(
+                        "C",
+                        "telegram_sender.py:_call_with_retry",
+                        "retry_ok",
+                        {"label": label, "attempt": i, "attempts": attempts},
+                    )
+                    # #endregion
+                return out
             except ApiTelegramException as exc:
                 err = str(exc).lower()
                 # Flood / retry_after
@@ -172,6 +219,20 @@ class TelegramSender:
                     m = re.search(r"retry.?after[\"\s:]+(\d+)", str(exc), re.I)
                     if m:
                         wait = int(m.group(1))
+                # #region agent log
+                agent_dbg(
+                    "C",
+                    "telegram_sender.py:_call_with_retry",
+                    "api_exc",
+                    {
+                        "label": label,
+                        "attempt": i,
+                        "network": _is_network_error(exc),
+                        "flood": bool(wait) or "too many requests" in err,
+                        "err": type(exc).__name__,
+                    },
+                )
+                # #endregion
                 if wait or "too many requests" in err or "flood" in err:
                     last = exc
                     sleep_for = max(wait, 2 * i) + 0.5
@@ -191,6 +252,19 @@ class TelegramSender:
                 raise
             except Exception as exc:
                 last = exc
+                # #region agent log
+                agent_dbg(
+                    "C",
+                    "telegram_sender.py:_call_with_retry",
+                    "net_exc",
+                    {
+                        "label": label,
+                        "attempt": i,
+                        "network": _is_network_error(exc),
+                        "err": type(exc).__name__,
+                    },
+                )
+                # #endregion
                 if _is_network_error(exc) and i < attempts:
                     time.sleep(2 * i)
                     continue
@@ -235,6 +309,9 @@ class TelegramSender:
 
     def resolve_alert_targets(self, db=None) -> list[int]:
         """ALERT_TG_ID + ALERT_TG_EXTRA (@username / numeric id)."""
+        pin = pinned_delivery_id()
+        if pin:
+            return [pin]
         targets: list[int] = []
         seen: set[int] = set()
 

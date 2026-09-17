@@ -8,7 +8,7 @@ from __future__ import annotations
 import sys
 
 from filters import post_passes_filters
-from hashtags import post_matches_tag, search_queries_for_tag
+from hashtags import all_search_queries_for_tag, post_matches_tag, search_queries_for_tag
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -27,7 +27,9 @@ LEADS = [
     "Нужно грамотное продвижение сайта в Яндексе, ищу подрядчика",
     "Киньте контакт нормального сеошника, сайт в поиске не видно",
     "Скиньте пожалуйста подрядчика по SEO для интернет-магазина",
-    "Кто занимается SEO? Нужен подрядчик, трафик с поиска упал в 2 раза",
+    "Нужен сайт , через Яндекс понять что ищут , сеопродвижение, блогеры телевидение",
+    "Я хочу создать впервые онлайн магазин . Подскажите сколько это "
+    "приблизительно стоит ,если делать под ключ ?",
 ]
 
 # Реальные отказы из scan_log — это НЕ лиды
@@ -52,16 +54,18 @@ JUNK = [
     "Нужно ли тебе SEO? Разберу твой сайт бесплатно, записывайтесь",
     "Бесплатная консультация по SEO, записывайтесь на разбор",
     "Нужна консультация косметолога, посоветуйте специалиста",
-    "Нужен хороший мастер по ремонту квартир, посоветуйте",
+    "Уважаемые клиенты! Если у вас есть задача разработать сайт и запустить "
+    "на него СЕО-продвижение, ищите сразу не фрилансера",
     "Поделитесь опытом, кто бегает по утрам",
     "Чек-лист: настрой robots.txt и sitemap, вот схема для сайта, забирай",
     "Сдаю квартиру в центре, 2 комнаты, ищу порядочных жильцов",
 ]
 
-# Посты без слова «SEO» в тексте обязаны доходить до фильтра (был скрытый отсев)
+# Посты без латинского «SEO» в тексте обязаны доходить до фильтра
 REACHABLE = [
     "Ищу сеошника на постоянку, сайт на тильде, органика упала",
     "Ищу человека для продвижения сайта в Google, бюджет есть",
+    "Нужно грамотное продвижение сайта в Яндексе, ищу подрядчика",
 ]
 
 fails: list[str] = []
@@ -70,6 +74,8 @@ for text in LEADS:
     ok, reason = post_passes_filters(text, "SEO", require_russian=True)
     if not ok:
         fails.append(f"ЛИД отброшен ({reason}): {text[:70]}")
+    if not post_matches_tag(text, {}, "SEO", from_tag_search=True):
+        fails.append(f"ЛИД не доходит до фильтра: {text[:70]}")
 
 for text in JUNK:
     ok, _ = post_passes_filters(text, "SEO", require_russian=True)
@@ -79,9 +85,25 @@ for text in JUNK:
 for text in REACHABLE:
     if not post_matches_tag(text, {}, "SEO", from_tag_search=True):
         fails.append(f"Пост не доходит до фильтра: {text[:70]}")
+    if not post_matches_tag(
+        text, {}, "SEO", from_tag_search=False, query="ищу сеошника"
+    ):
+        fails.append(f"Hire «ищу сеошника» отсекла лид на скрейпе: {text[:70]}")
+    if not post_matches_tag(
+        text, {}, "SEO", from_tag_search=False, query="продвижение сайта"
+    ):
+        fails.append(f"Hire-фраза отсекла лид на скрейпе: {text[:70]}")
+if post_matches_tag(
+    "Ищу девушку в Одессе на наращивание",
+    {},
+    "SEO",
+    from_tag_search=False,
+    query="ищу сеошника",
+):
+    fails.append("Hire-фраза пропустила оффтоп без сео")
 
 seo = {q for _l, q in search_queries_for_tag("SEO")}
-geo = {q for _l, q in search_queries_for_tag("GEO")}
+geo = {q for _l, q in all_search_queries_for_tag("GEO")}
 if seo & geo:
     fails.append(f"Запросы SEO и GEO дублируются: {sorted(seo & geo)}")
 if not seo or not geo:

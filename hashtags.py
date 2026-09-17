@@ -109,7 +109,67 @@ def text_mentions_tag(text: str, tag: str) -> bool:
         rf"(?<![\wа-яА-ЯёЁ]){re.escape(tag)}(?![\wа-яА-ЯёЁ])",
         re.IGNORECASE,
     )
-    return bool(pattern.search(text or ""))
+    if pattern.search(text or ""):
+        return True
+    return topic_text_matches_tag(text or "", tag)
+
+
+def topic_text_matches_tag(text: str, tag: str) -> bool:
+    """SEO/GEO: «сеошник» и «продвижение сайта» тоже про тему, не только латинское SEO."""
+    key = normalize_hashtag(tag).casefold()
+    raw = text or ""
+    if key in {"seo", "сео"}:
+        return bool(
+            re.search(
+                r"(?iu)seo|сео|сэо|сеошник|сеопродвижен|"
+                r"продвижен\w*\s+сайт|раскрутк\w*\s+сайт|"
+                r"органик|поисков\w+\s+трафик|вывести\s+(?:сайт\s+)?в\s+топ",
+                raw,
+            )
+        )
+    if key in {"geo", "гео"}:
+        return bool(
+            re.search(
+                r"(?iu)#?geo\b|#?гео\b|chatgpt|perplexity|нейросет|"
+                r"ai\s*overview|ai[\s\-]?видимост|видимость\s+в\s+(?:ии|chatgpt)",
+                raw,
+            )
+        )
+    return False
+
+
+def query_terms_in_text(text: str, query: str) -> bool:
+    """Hire-фраза: в посте должны быть значимые слова запроса (не каша Threads)."""
+    q = (query or "").strip().lstrip("#")
+    if not q:
+        return False
+    stop = {
+        "нужен",
+        "нужна",
+        "нужно",
+        "нужны",
+        "ищу",
+        "ищем",
+        "кто",
+        "для",
+        "лента",
+    }
+    words = [
+        w.casefold()
+        for w in re.split(r"\s+", q)
+        if len(w) >= 4 and w.casefold() not in stop
+    ]
+    if not words:
+        return False
+    body = text or ""
+    return all(
+        re.search(
+            rf"(?<![A-Za-zА-Яа-яЁё0-9_]){re.escape(w)}(?![A-Za-zА-Яа-яЁё0-9_])",
+            body,
+            flags=re.IGNORECASE,
+        )
+        for w in words
+    )
 
 
 def extract_topic_names(post: dict[str, Any]) -> list[str]:
@@ -156,10 +216,11 @@ def post_matches_tag(
     *,
     from_tag_search: bool = False,
     own_post: bool = False,
+    query: str = "",
 ) -> bool:
     """
     Пост с страницы #поиска уже в выдаче тега — текст без слова SEO тоже берём.
-    Иначе «ищу продвижение сайта» в топике SEO выкидывался.
+    Hire-фраза: нужны слова запроса или SEO/GEO-маркер, иначе каша Threads.
     """
     _ = own_post
     tag_n = normalize_hashtag(tag)
@@ -167,19 +228,20 @@ def post_matches_tag(
         return False
     if from_tag_search:
         return True
-    if text_mentions_tag(text or "", tag_n):
+    raw = text or ""
+    if text_mentions_tag(raw, tag_n) or topic_text_matches_tag(raw, tag_n):
+        return True
+    if query and query_terms_in_text(raw, query):
         return True
     topics = extract_topic_names(post or {})
     return any(normalize_hashtag(n).casefold() == tag_n.casefold() for n in topics)
 
 
-# Threads режет частые поиски (HTTP 429). Один цикл — немного запросов,
-# остальные доберём в следующих циклах по кругу.
-QUERIES_PER_CYCLE = 5
+# Threads режет частые поиски (HTTP 429). Один цикл — 1–2 запроса.
+QUERIES_PER_CYCLE = 3
 CORE_QUERIES = 2
-# За сутки #GEO съел 2699 поисков и дал 0 лидов, #SEO — 4 лида.
-# Поэтому лимит запросов делим не поровну.
-TAG_BUDGET = {"seo": 4, "сео": 4, "geo": 1, "гео": 1}
+# За сутки #GEO съел 2699 поисков и дал 0 лидов — ночью не ищем GEO.
+TAG_BUDGET = {"seo": 3, "сео": 3, "geo": 0, "гео": 0}
 _rotation: dict[str, int] = {}
 
 
@@ -201,12 +263,16 @@ def search_queries_for_tag(tag: str) -> list[tuple[str, str]]:
     full = all_search_queries_for_tag(tag)
     key = normalize_hashtag(tag).casefold()
     budget = TAG_BUDGET.get(key, QUERIES_PER_CYCLE)
+    if budget <= 0:
+        return []
     if len(full) <= budget:
         return full
-    core_n = min(CORE_QUERIES, max(0, budget - 1))
+    core_n = min(CORE_QUERIES, budget)
     core = full[:core_n]
     rest = full[core_n:]
     take = budget - core_n
+    if not rest or take <= 0:
+        return core
     offset = _rotation.get(key, 0) % len(rest)
     picked = [rest[(offset + i) % len(rest)] for i in range(take)]
     _rotation[key] = offset + take
@@ -219,35 +285,34 @@ def all_search_queries_for_tag(tag: str) -> list[tuple[str, str]]:
     t = normalize_hashtag(tag)
 
     if key in {"seo", "сео"}:
-        # Кириллица первой: латинская лента #SEO на 70% англоязычная.
-        # Много разных запросов = разные выдачи = шире охват заказчиков.
+        # Hire-фразы первыми: лента #сео — англоязычный топ и старые посты.
         base = [
             ("ищу сеошника", "ищу сеошника"),
-            ("#сео лента", "#сео"),
-            ("нужен сео", "нужен сео"),
-            ("продвижение сайта", "продвижение сайта"),
-            (f"#{t} лента", f"#{t}"),
-            ("ищу seo специалиста", "ищу seo специалиста"),
-            ("органика упала кто", "органика упала"),
-            ("посоветуйте сеошника", "посоветуйте сеошника"),
             ("нужен сеошник", "нужен сеошник"),
-            ("кто занимается seo", "кто занимается seo"),
+            ("продвижение сайта", "продвижение сайта"),
+            ("посоветуйте сеошника", "посоветуйте сеошника"),
+            ("#сео лента", "#сео"),
             ("#сеопродвижение", "#сеопродвижение"),
             ("#продвижениесайта", "#продвижениесайта"),
+            ("нужен сео", "нужен сео"),
+            ("ищу seo специалиста", "ищу seo специалиста"),
+            ("органика упала кто", "органика упала"),
+            ("кто занимается seo", "кто занимается seo"),
             ("#сеоспециалист", "#сеоспециалист"),
             ("сайт не в поиске", "сайт не в поиске"),
             ("нужен аудит сайта", "нужен аудит сайта"),
             ("вывести сайт в топ", "вывести сайт в топ"),
+            (f"#{t} лента", f"#{t}"),
         ]
     elif key in {"geo", "гео"}:
         # Свои запросы: общие hire-фразы уже отрабатывает #SEO, не дублируем
         base = [
-            (f"#{t} лента", f"#{t}"),
             ("продвижение в chatgpt", "продвижение в chatgpt"),
-            ("продвижение в нейросетях", "продвижение в нейросетях"),
+            ("видимость в chatgpt", "видимость в chatgpt"),
             ("оптимизация под нейросети", "оптимизация под нейросети"),
-            ("#гео лента", "#гео"),
             ("не находит chatgpt", "не находит chatgpt"),
+            ("#гео лента", "#гео"),
+            (f"#{t} лента", f"#{t}"),
         ]
     else:
         base = [
@@ -288,8 +353,8 @@ def query_fetch_cap(query: str) -> int:
     """Сколько карточек тянуть с одного Recent URL."""
     q = (query or "").strip().casefold()
     if q.startswith("#"):
-        return 40
-    return 30
+        return 16
+    return 12
 
 
 def build_recent_search_url(query: str) -> str:
